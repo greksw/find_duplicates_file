@@ -1,4 +1,23 @@
+Команда для запуска:
 # Переходим в корень и запускаем
 cd /mnt/data/Exchange
 chmod +x find_duplicates_exchange.sh
 ./find_duplicates_exchange.sh
+
+Мониторинг выполнения:
+# В отдельной сессии следим за прогрессом
+tail -f /tmp/duplicates_scan_*.log
+
+# Или смотрим утилизацию ZFS
+zpool iostat data 1
+
+# Проверяем нагрузку
+top -o cpu
+
+
+После завершения:
+# Смотрим результаты
+less /tmp/duplicates_exchange_*.txt
+
+# Проверяем самые большие группы дубликатов
+grep -A 10 "ГРУППА" /tmp/duplicates_exchange_*.txt | head -50
