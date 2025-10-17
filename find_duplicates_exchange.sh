@@ -27,16 +27,56 @@ get_md5() {
     fi
 }
 
-# Функция для получения даты модификации
-get_mtime() {
-    local file="$1"
-    stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$file" 2>/dev/null || echo "UNKNOWN"
-}
-
-# Функция для получения размера
-get_size() {
-    local file="$1"
-    stat -f%z "$file" 2>/dev/null || echo "0"
+# Функция для обработки группы файлов
+process_group() {
+    local group_files="$1"
+    local key="$2"
+    
+    # Разбиваем ключ на составляющие
+    name=$(echo "$key" | cut -d'|' -f1)
+    mtime=$(echo "$key" | cut -d'|' -f2)
+    size=$(echo "$key" | cut -d'|' -f3)
+    
+    first_file=""
+    
+    # Временный файл для хэшей в группе
+    TEMP_GROUP_HASHES=$(mktemp)
+    
+    # Вычисляем хэши для всех файлов в группе
+    echo "$group_files" | while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        
+        if [ -z "$first_file" ]; then
+            first_file="$file"
+        fi
+        
+        hash=$(get_md5 "$file")
+        if [ "$hash" != "ERROR" ]; then
+            echo "$hash|$file" >> "$TEMP_GROUP_HASHES"
+        fi
+    done
+    
+    # Ищем дубликаты по хэшу в группе
+    if [ -f "$TEMP_GROUP_HASHES" ] && [ -s "$TEMP_GROUP_HASHES" ]; then
+        sort "$TEMP_GROUP_HASHES" | awk -F'|' '
+        BEGIN { printed_group = 0 }
+        {
+            hash = $1
+            file = $2
+            if (hash == prev_hash) {
+                if (!printed_group) {
+                    print ""
+                    print "РЕАЛЬНЫЕ ДУБЛИКАТЫ: \"" name "\" (" mtime ", " size " байт)"
+                    print "Первый файл: " first_file
+                    printed_group = 1
+                }
+                print "Дубликат: " file
+            }
+            prev_hash = hash
+        }' name="$name" mtime="$mtime" size="$size" first_file="$first_file" >> "$TEMP_HASH_DUPLICATES"
+    fi
+    
+    rm -f "$TEMP_GROUP_HASHES"
 }
 
 # Основной процесс
@@ -59,15 +99,9 @@ get_size() {
         mtime=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$1" 2>/dev/null || echo "UNKNOWN")
         size=$(stat -f%z "$1" 2>/dev/null || echo "0")
         echo "$filename|$mtime|$size|$dirname|$1"
-    ' _ {} \; | while IFS='|' read -r filename mtime size dirname file; do
-        counter=$((counter + 1))
-        if [ $((counter % 500)) -eq 0 ]; then
-            echo "Обработано файлов: $counter"
-        fi
-        echo "$filename|$mtime|$size|$dirname|$file" >> "$TEMP_ALL_FILES"
-    done
+    ' _ {} \; > "$TEMP_ALL_FILES"
 
-    total_files=$counter
+    total_files=$(wc -l < "$TEMP_ALL_FILES")
     echo "Всего файлов: $total_files"
     echo ""
 
@@ -148,29 +182,28 @@ get_size() {
         for (key in group) {
             print "GROUP:" key
             printf "%s", group[key]
+            print ""  # разделитель между группами
         }
-    }' "$TEMP_DATE_DUPLICATES" > "$TEMP_HASH_DUPLICATES.tmp"
+    }' "$TEMP_DATE_DUPLICATES" > "${TEMP_HASH_DUPLICATES}.tmp"
 
     # Обрабатываем группы и вычисляем хэши
     group_processed=0
+    current_files=""
+    current_key=""
+    
     while IFS= read -r line; do
         if echo "$line" | grep -q "^GROUP:"; then
+            # Обрабатываем предыдущую группу
+            if [ -n "$current_files" ] && [ -n "$current_key" ]; then
+                process_group "$current_files" "$current_key"
+                group_processed=$((group_processed + 1))
+            fi
             current_key=$(echo "$line" | cut -d: -f2-)
             current_files=""
-        else
-            if [ -n "$line" ]; then
-                current_files="$current_files$line"$'\n'
-            else
-                # Обрабатываем группу когда встречаем пустую строку
-                if [ -n "$current_files" ] && [ -n "$current_key" ]; then
-                    process_group "$current_files" "$current_key"
-                    group_processed=$((group_processed + 1))
-                    current_files=""
-                    current_key=""
-                fi
-            fi
+        elif [ -n "$line" ]; then
+            current_files="${current_files}${line}"$'\n'
         fi
-    done < "$TEMP_HASH_DUPLICATES.tmp"
+    done < "${TEMP_HASH_DUPLICATES}.tmp"
 
     # Обрабатываем последнюю группу
     if [ -n "$current_files" ] && [ -n "$current_key" ]; then
@@ -200,64 +233,11 @@ get_size() {
     echo "Файлов с одинаковыми именами+датами+размерами: $(wc -l < "$TEMP_DATE_DUPLICATES" 2>/dev/null || echo 0)"
     echo "Реальных дубликатов (прошли все фильтры): $hash_dups групп"
 
-} > "$OUTPUT_FILE" 2>&1
-
-# Функция для обработки группы файлов
-process_group() {
-    local group_files="$1"
-    local key="$2"
-    
-    # Разбиваем ключ на составляющие
-    name=$(echo "$key" | cut -d'|' -f1)
-    mtime=$(echo "$key" | cut -d'|' -f2)
-    size=$(echo "$key" | cut -d'|' -f3)
-    
-    first_file=""
-    found_duplicates=0
-    
-    # Временный файл для хэшей в группе
-    TEMP_GROUP_HASHES=$(mktemp)
-    
-    # Вычисляем хэши для всех файлов в группе
-    echo "$group_files" | while IFS= read -r file; do
-        [ -z "$file" ] && continue
-        
-        if [ -z "$first_file" ]; then
-            first_file="$file"
-        fi
-        
-        hash=$(get_md5 "$file")
-        if [ "$hash" != "ERROR" ]; then
-            echo "$hash|$file" >> "$TEMP_GROUP_HASHES"
-        fi
-    done
-    
-    # Ищем дубликаты по хэшу в группе
-    if [ -f "$TEMP_GROUP_HASHES" ] && [ -s "$TEMP_GROUP_HASHES" ]; then
-        sort "$TEMP_GROUP_HASHES" | awk -F'|' '
-        BEGIN { printed_group = 0 }
-        {
-            hash = $1
-            file = $2
-            if (hash == prev_hash) {
-                if (!printed_group) {
-                    print ""
-                    print "РЕАЛЬНЫЕ ДУБЛИКАТЫ: \"" name "\" (" mtime ", " size " байт)"
-                    print "Первый файл: " first_file
-                    printed_group = 1
-                }
-                print "Дубликат: " file
-            }
-            prev_hash = hash
-        }' name="$name" mtime="$mtime" size="$size" first_file="$first_file" >> "$TEMP_HASH_DUPLICATES"
-    fi
-    
-    rm -f "$TEMP_GROUP_HASHES"
-}
+} | tee "$OUTPUT_FILE"
 
 # Очистка временных файлов
 cleanup() {
-    rm -f "$TEMP_ALL_FILES" "$TEMP_NAME_DUPLICATES" "$TEMP_DATE_DUPLICATES" "$TEMP_HASH_DUPLICATES" "$TEMP_HASH_DUPLICATES.tmp"
+    rm -f "$TEMP_ALL_FILES" "$TEMP_NAME_DUPLICATES" "$TEMP_DATE_DUPLICATES" "$TEMP_HASH_DUPLICATES" "${TEMP_HASH_DUPLICATES}.tmp"
 }
 
 trap cleanup EXIT
