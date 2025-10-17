@@ -1,145 +1,210 @@
 #!/bin/bash
 
-# Специальная версия для data/Exchange 702GB
-SEARCH_DIR="/mnt/data/Exchange"
-OUTPUT_FILE="/tmp/duplicates_exchange_$(date +%Y%m%d_%H%M%S).txt"
-LOG_FILE="/tmp/duplicates_scan_$(date +%Y%m%d_%H%M%S).log"
+# Скрипт поиска дубликатов по имени, дате и хэшу для TrueNAS Core
+SEARCH_DIR="${1:-/mnt/data/Exchange}"
+OUTPUT_FILE="${2:-/tmp/duplicates_report_$(date +%Y%m%d_%H%M%S).txt}"
+MAX_DEPTH="${3:-10}"
 
-echo "=== ПОИСК ДУБЛИКАТОВ: data/Exchange ==="
-echo "Объем данных: 702GB"
-echo "Компрессия: lz4"
-echo "Дедупликация: off"
-echo "Результаты: $OUTPUT_FILE"
-echo "Лог: $LOG_FILE"
+echo "=== ПОИСК ДУБЛИКАТОВ: имя, дата, хэш ==="
+echo "Директория: $SEARCH_DIR"
+echo "Результат: $OUTPUT_FILE"
+echo "Макс. глубина: $MAX_DEPTH"
 echo ""
 
 {
-    echo "Начало сканирования: $(date)"
-    echo "Директория: $SEARCH_DIR"
-    echo "Объем данных: 702GB"
-    
-    # Проверка доступности директории
-    if [ ! -d "$SEARCH_DIR" ]; then
-        echo "ОШИБКА: Директория $SEARCH_DIR не найдена!"
-        exit 1
-    fi
-    
-    # Временный файл для хэшей
-    TEMP_HASHES=$(mktemp)
-    echo "Временный файл: $TEMP_HASHES"
-    
-    # Счетчики
-    counter=0
-    echo "Подсчет файлов..."
-    total_files=$(find "$SEARCH_DIR" -type f | wc -l)
-    echo "Всего файлов: $total_files"
-    
-    echo "Начало хэширования: $(date)"
-    
-    # Оптимизированный поиск с прогресс-баром
-    find "$SEARCH_DIR" -type f -print0 | while IFS= read -r -d '' file; do
-        ((counter++))
-        
-        # Прогресс каждые 500 файлов
-        if (( counter % 500 == 0 )); then
-            percent=$(( counter * 100 / total_files ))
-            echo "Прогресс: $counter/$total_files ($percent%) - $(date)"
-        fi
-        
-        # Вычисляем MD5 хэш (FreeBSD)
-        hash=$(md5 -q "$file" 2>/dev/null)
-        size=$(stat -f%z "$file" 2>/dev/null)
-        
-        if [ -n "$hash" ] && [ -n "$size" ]; then
-            echo "$hash $size $file" >> "$TEMP_HASHES"
+    echo "ОТЧЕТ О ДУБЛИКАТАХ ФАЙЛОВ"
+    echo "Дата создания: $(date)"
+    echo "Директория поиска: $SEARCH_DIR"
+    echo "Критерии: имя файла, дата модификации, MD5 хэш"
+    echo "=============================================="
+    echo ""
+
+    # Временные файлы
+    TEMP_ALL_FILES=$(mktemp)
+    TEMP_NAME_DUPLICATES=$(mktemp)
+    TEMP_DATE_DUPLICATES=$(mktemp)
+    TEMP_HASH_DUPLICATES=$(mktemp)
+
+    # Функция для получения MD5 хэша (FreeBSD)
+    get_md5() {
+        local file="$1"
+        if command -v md5 >/dev/null 2>&1; then
+            md5 -q "$file" 2>/dev/null || echo "ERROR"
         else
-            echo "Ошибка: $file" >> "${LOG_FILE}.errors"
+            md5sum "$file" 2>/dev/null | awk '{print $1}' || echo "ERROR"
         fi
-    done
-    
-    echo "Хэширование завершено: $(date)"
-    echo "Поиск дубликатов..."
-    
-    # Сортировка и анализ
-    sort "$TEMP_HASHES" | awk '
-    BEGIN {
-        group_count = 0
-        duplicate_count = 0
-        wasted_space = 0
-        current_group = ""
-        
-        print "ДУБЛИКАТЫ ФАЙЛОВ - data/Exchange"
-        print "Дата: " strftime("%Y-%m-%d %H:%M:%S")
-        print "=============================================="
     }
+
+    # Функция для получения даты модификации
+    get_mtime() {
+        local file="$1"
+        stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$file" 2>/dev/null || echo "UNKNOWN"
+    }
+
+    # Функция для получения размера
+    get_size() {
+        local file="$1"
+        stat -f%z "$file" 2>/dev/null || echo "0"
+    }
+
+    echo "1. СБОР ИНФОРМАЦИИ О ФАЙЛАХ..."
+    echo "----------------------------"
+
+    # Находим все файлы и собираем информацию
+    counter=0
+    find "$SEARCH_DIR" -type f -maxdepth "$MAX_DEPTH" -print0 | while IFS= read -r -d '' file; do
+        ((counter++))
+        if (( counter % 500 == 0 )); then
+            echo "Обработано файлов: $counter"
+        fi
+        
+        filename=$(basename "$file")
+        dirname=$(dirname "$file")
+        mtime=$(get_mtime "$file")
+        size=$(get_size "$file")
+        
+        # Записываем информацию о файле
+        echo "$filename|$mtime|$size|$dirname|$file" >> "$TEMP_ALL_FILES"
+    done
+
+    total_files=$counter
+    echo "Всего файлов: $total_files"
+    echo ""
+
+    echo "2. ПОИСК ДУБЛИКАТОВ ПО ИМЕНИ ФАЙЛА..."
+    echo "-----------------------------------"
+
+    # Дубликаты по имени
+    awk -F'|' '
+    {
+        name = $1
+        mtime = $2
+        size = $3
+        dir = $4
+        path = $5
+        
+        if (names[name]) {
+            if (!printed[name]) {
+                print "\nДУБЛИКАТЫ ПО ИМЕНИ: \"" name "\""
+                print "Первый файл: " first_path[name]
+                printed[name] = 1
+            }
+            print "Дубликат: " path " (Дата: " mtime ", Размер: " size ")"
+        } else {
+            names[name] = 1
+            first_path[name] = path
+        }
+    }' "$TEMP_ALL_FILES" > "$TEMP_NAME_DUPLICATES"
+
+    name_dups=$(grep -c "ДУБЛИКАТЫ ПО ИМЕНИ" "$TEMP_NAME_DUPLICATES" || echo "0")
+    echo "Найдено групп дубликатов по имени: $name_dups"
+    echo ""
+
+    echo "3. ПОИСК ДУБЛИКАТОВ ПО ДАТЕ И РАЗМЕРУ..."
+    echo "--------------------------------------"
+
+    # Дубликаты по дате и размеру (быстрая проверка)
+    awk -F'|' '
+    {
+        name = $1
+        mtime = $2
+        size = $3
+        dir = $4
+        path = $5
+        
+        key = mtime "|" size
+        if (dates[key]) {
+            if (!printed[key]) {
+                print "\nДУБЛИКАТЫ ПО ДАТЕ/РАЗМЕРУ: " mtime " (" size " байт)"
+                print "Первый файл: " first_path[key]
+                printed[key] = 1
+            }
+            print "Дубликат: " path " (Имя: " name ")"
+        } else {
+            dates[key] = 1
+            first_path[key] = path
+        }
+    }' "$TEMP_ALL_FILES" > "$TEMP_DATE_DUPLICATES"
+
+    date_dups=$(grep -c "ДУБЛИКАТЫ ПО ДАТЕ/РАЗМЕРУ" "$TEMP_DATE_DUPLICATES" || echo "0")
+    echo "Найдено групп дубликатов по дате/размеру: $date_dups"
+    echo ""
+
+    echo "4. ПОИСК ДУБЛИКАТОВ ПО ХЭШУ (MD5)..."
+    echo "----------------------------------"
+
+    # Дубликаты по хэшу (только для потенциальных кандидатов)
+    echo "Вычисление хэшей для файлов-кандидатов..."
+    
+    # Собираем файлы которые могут быть дубликатами по дате/размеру
+    awk -F'|' '
+    {
+        mtime = $2
+        size = $3
+        path = $5
+        
+        key = mtime "|" size
+        count[key]++
+        if (count[key] > 1) {
+            print path
+        }
+    }' "$TEMP_ALL_FILES" | while read -r file; do
+        hash=$(get_md5 "$file")
+        if [ "$hash" != "ERROR" ]; then
+            echo "$hash|$file"
+        fi
+    done | sort | awk -F'|' '
     {
         hash = $1
-        size = $2
-        path = substr($0, index($0, $3))
+        path = $2
         
         if (hash == prev_hash) {
-            if (current_group != hash) {
-                # Новая группа дубликатов
-                group_count++
-                current_group = hash
-                print "\n" 
-                print "ГРУППА #" group_count
-                print "Хэш: " hash
-                print "Размер: " size " байт"
-                print "Файлы:"
-                print prev_path
-                duplicate_count++
-                wasted_space += size
+            if (!printed[hash]) {
+                print "\nДУБЛИКАТЫ ПО ХЭШУ: " hash
+                print "Первый файл: " first_path[hash]
+                printed[hash] = 1
             }
-            print path
-            duplicate_count++
-            wasted_space += size
-        }
-        
-        prev_hash = hash
-        prev_size = size
-        prev_path = path
-    }
-    END {
-        print "\n=============================================="
-        print "ФИНАЛЬНАЯ СТАТИСТИКА:"
-        print "Всего групп дубликатов: " group_count
-        print "Всего файлов-дубликатов: " duplicate_count
-        print "Потенциальная экономия места:"
-        
-        if (wasted_space >= 1099511627776) {
-            printf "  %.2f TB\n", wasted_space / 1099511627776
-        } else if (wasted_space >= 1073741824) {
-            printf "  %.2f GB\n", wasted_space / 1073741824
-        } else if (wasted_space >= 1048576) {
-            printf "  %.2f MB\n", wasted_space / 1048576
-        } else if (wasted_space >= 1024) {
-            printf "  %.2f KB\n", wasted_space / 1024
+            print "Дубликат: " path
         } else {
-            print "  " wasted_space " байт"
+            prev_hash = hash
+            first_path[hash] = path
         }
-        
-        if (total_files > 0) {
-            duplicate_percent = (duplicate_count * 100) / (total_files + duplicate_count)
-            printf "Дубликаты составляют: %.1f%% от всех файлов\n", duplicate_percent
-        }
-    }' total_files=$total_files > "$OUTPUT_FILE"
-    
-    # Очистка
-    rm -f "$TEMP_HASHES"
-    
-    echo "Сканирование завершено: $(date)"
-    
-    # Финальная статистика
+    }' > "$TEMP_HASH_DUPLICATES"
+
+    hash_dups=$(grep -c "ДУБЛИКАТЫ ПО ХЭШУ" "$TEMP_HASH_DUPLICATES" || echo "0")
+    echo "Найдено групп дубликатов по хэшу: $hash_dups"
     echo ""
-    echo "=== КРАТКАЯ СТАТИСТИКА ==="
-    grep "ГРУППА #" "$OUTPUT_FILE" | tail -1
-    grep "Всего групп" "$OUTPUT_FILE"
-    grep "Потенциальная экономия" "$OUTPUT_FILE" | head -1
+
+    echo "5. ФОРМИРОВАНИЕ ОТЧЕТА..."
+    echo "-----------------------"
+
+    # Объединяем все результаты
+    echo "=== ДУБЛИКАТЫ ПО ИМЕНИ ФАЙЛА ==="
+    cat "$TEMP_NAME_DUPLICATES"
+    echo ""
     
-} 2>&1 | tee "$LOG_FILE"
+    echo "=== ДУБЛИКАТЫ ПО ДАТЕ И РАЗМЕРУ ==="
+    cat "$TEMP_DATE_DUPLICATES"
+    echo ""
+    
+    echo "=== ДУБЛИКАТЫ ПО ХЭШУ (MD5) ==="
+    cat "$TEMP_HASH_DUPLICATES"
+    echo ""
+
+    echo "=============================================="
+    echo "СТАТИСТИКА:"
+    echo "Всего файлов проверено: $total_files"
+    echo "Дубликатов по имени: $name_dups групп"
+    echo "Дубликатов по дате/размеру: $date_dups групп"
+    echo "Дубликатов по хэшу: $hash_dups групп"
+    echo ""
+    echo "Отчет сохранен: $OUTPUT_FILE"
+
+    # Очистка временных файлов
+    rm -f "$TEMP_ALL_FILES" "$TEMP_NAME_DUPLICATES" "$TEMP_DATE_DUPLICATES" "$TEMP_HASH_DUPLICATES"
+
+} 2>&1 | tee "$OUTPUT_FILE"
 
 echo ""
 echo "=== ЗАВЕРШЕНО ==="
-echo "Полные результаты: $OUTPUT_FILE"
-echo "Детальный лог: $LOG_FILE"
+echo "Полный отчет: $OUTPUT_FILE"
