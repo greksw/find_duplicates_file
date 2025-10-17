@@ -1,247 +1,235 @@
-#!/bin/sh
+#!/bin/bash
 
-# Скрипт поиска дубликатов с последовательной фильтрацией для TrueNAS
+# Скрипт поиска дубликатов по имени, размеру и хэшу для TrueNAS Core
 SEARCH_DIR="${1:-/mnt/data/Exchange}"
-OUTPUT_FILE="${2:-/tmp/real_duplicates_$(date +%Y%m%d_%H%M%S).txt}"
+OUTPUT_FILE="${2:-/tmp/duplicates_report_$(date +%Y%m%d_%H%M%S).txt}"
 MAX_DEPTH="${3:-10}"
 
-echo "=== ПОИСК РЕАЛЬНЫХ ДУБЛИКАТОВ: имя → дата/размер → хэш ==="
+echo "=== ПОИСК ДУБЛИКАТОВ: имя, размер, хэш ==="
 echo "Директория: $SEARCH_DIR"
 echo "Результат: $OUTPUT_FILE"
 echo "Макс. глубина: $MAX_DEPTH"
 echo ""
 
-# Временные файлы
-TEMP_ALL_FILES=$(mktemp)
-TEMP_NAME_DUPLICATES=$(mktemp)
-TEMP_DATE_DUPLICATES=$(mktemp)
-TEMP_HASH_DUPLICATES=$(mktemp)
-
-# Функция для получения MD5 хэша (FreeBSD)
-get_md5() {
-    local file="$1"
-    if command -v md5 >/dev/null 2>&1; then
-        md5 -q "$file" 2>/dev/null || echo "ERROR"
-    else
-        md5sum "$file" 2>/dev/null | awk '{print $1}' || echo "ERROR"
-    fi
-}
-
-# Функция для обработки группы файлов
-process_group() {
-    local group_files="$1"
-    local key="$2"
-    
-    # Разбиваем ключ на составляющие
-    name=$(echo "$key" | cut -d'|' -f1)
-    mtime=$(echo "$key" | cut -d'|' -f2)
-    size=$(echo "$key" | cut -d'|' -f3)
-    
-    first_file=""
-    
-    # Временный файл для хэшей в группе
-    TEMP_GROUP_HASHES=$(mktemp)
-    
-    # Вычисляем хэши для всех файлов в группе
-    echo "$group_files" | while IFS= read -r file; do
-        [ -z "$file" ] && continue
-        
-        if [ -z "$first_file" ]; then
-            first_file="$file"
-        fi
-        
-        hash=$(get_md5 "$file")
-        if [ "$hash" != "ERROR" ]; then
-            echo "$hash|$file" >> "$TEMP_GROUP_HASHES"
-        fi
-    done
-    
-    # Ищем дубликаты по хэшу в группе
-    if [ -f "$TEMP_GROUP_HASHES" ] && [ -s "$TEMP_GROUP_HASHES" ]; then
-        sort "$TEMP_GROUP_HASHES" | awk -F'|' '
-        BEGIN { printed_group = 0 }
-        {
-            hash = $1
-            file = $2
-            if (hash == prev_hash) {
-                if (!printed_group) {
-                    print ""
-                    print "РЕАЛЬНЫЕ ДУБЛИКАТЫ: \"" name "\" (" mtime ", " size " байт)"
-                    print "Первый файл: " first_file
-                    printed_group = 1
-                }
-                print "Дубликат: " file
-            }
-            prev_hash = hash
-        }' name="$name" mtime="$mtime" size="$size" first_file="$first_file" >> "$TEMP_HASH_DUPLICATES"
-    fi
-    
-    rm -f "$TEMP_GROUP_HASHES"
-}
-
-# Основной процесс
 {
-    echo "ОТЧЕТ О РЕАЛЬНЫХ ДУБЛИКАТАХ ФАЙЛОВ"
+    echo "ОТЧЕТ О ДУБЛИКАТАХ ФАЙЛОВ"
     echo "Дата создания: $(date)"
     echo "Директория поиска: $SEARCH_DIR"
-    echo "Критерии: одинаковое имя → одинаковая дата/размер → одинаковый хэш"
+    echo "Критерии: имя файла, размер, MD5 хэш"
     echo "=============================================="
     echo ""
+
+    # Временные файлы
+    TEMP_ALL_FILES=$(mktemp)
+    TEMP_NAME_SIZE_DUPLICATES=$(mktemp)
+    TEMP_HASH_CANDIDATES=$(mktemp)
+    TEMP_HASH_DUPLICATES=$(mktemp)
+
+    # Функция для получения MD5 хэша (FreeBSD)
+    get_md5() {
+        local file="$1"
+        if command -v md5 >/dev/null 2>&1; then
+            md5 -q "$file" 2>/dev/null || echo "ERROR"
+        else
+            md5sum "$file" 2>/dev/null | awk '{print $1}' || echo "ERROR"
+        fi
+    }
+
+    # Функция для получения даты модификации
+    get_mtime() {
+        local file="$1"
+        stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$file" 2>/dev/null || echo "UNKNOWN"
+    }
+
+    # Функция для получения размера
+    get_size() {
+        local file="$1"
+        stat -f%z "$file" 2>/dev/null || echo "0"
+    }
 
     echo "1. СБОР ИНФОРМАЦИИ О ФАЙЛАХ..."
     echo "----------------------------"
 
     # Находим все файлы и собираем информацию
     counter=0
-    find "$SEARCH_DIR" -type f -maxdepth "$MAX_DEPTH" -exec sh -c '
-        filename=$(basename "$1")
-        dirname=$(dirname "$1")
-        mtime=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$1" 2>/dev/null || echo "UNKNOWN")
-        size=$(stat -f%z "$1" 2>/dev/null || echo "0")
-        echo "$filename|$mtime|$size|$dirname|$1"
-    ' _ {} \; > "$TEMP_ALL_FILES"
+    find "$SEARCH_DIR" -type f -maxdepth "$MAX_DEPTH" -print0 | while IFS= read -r -d '' file; do
+        ((counter++))
+        if (( counter % 500 == 0 )); then
+            echo "Обработано файлов: $counter"
+        fi
+        
+        filename=$(basename "$file")
+        dirname=$(dirname "$file")
+        mtime=$(get_mtime "$file")
+        size=$(get_size "$file")
+        
+        # Записываем информацию о файле
+        echo "$filename|$size|$mtime|$dirname|$file" >> "$TEMP_ALL_FILES"
+    done
 
-    total_files=$(wc -l < "$TEMP_ALL_FILES")
+    total_files=$counter
     echo "Всего файлов: $total_files"
     echo ""
 
-    echo "2. ФИЛЬТРАЦИЯ: ДУБЛИКАТЫ ПО ИМЕНИ..."
-    echo "-----------------------------------"
+    echo "2. ПОИСК ДУБЛИКАТОВ ПО ИМЕНИ И РАЗМЕРУ..."
+    echo "----------------------------------------"
 
-    # Находим файлы с одинаковыми именами
+    # Дубликаты по имени и размеру
     awk -F'|' '
     {
         name = $1
-        mtime = $2
-        size = $3
+        size = $2
+        mtime = $3
         dir = $4
         path = $5
         
-        if (names[name]) {
-            print $0
-            if (!printed[name]) {
-                print first_line[name]
-                printed[name] = 1
-            }
-        } else {
-            names[name] = 1
-            first_line[name] = $0
-        }
-    }' "$TEMP_ALL_FILES" > "$TEMP_NAME_DUPLICATES"
-
-    name_dups=$(awk -F'|' '{print $1}' "$TEMP_NAME_DUPLICATES" | sort -u | wc -l)
-    echo "Найдено файлов-кандидатов по имени: $(wc -l < "$TEMP_NAME_DUPLICATES")"
-    echo "Уникальных имен с дубликатами: $name_dups"
-    echo ""
-
-    echo "3. ФИЛЬТРАЦИЯ: ДУБЛИКАТЫ ПО ДАТЕ/РАЗМЕРУ..."
-    echo "------------------------------------------"
-
-    # Среди файлов с одинаковыми именами ищем одинаковые дату/размер
-    awk -F'|' '
-    {
-        name = $1
-        mtime = $2
-        size = $3
-        dir = $4
-        path = $5
-        
-        key = name "|" mtime "|" size
-        if (dates[key]) {
-            print $0
+        key = name "|" size
+        if (keys[key]) {
             if (!printed[key]) {
-                print first_line[key]
+                print "\nДУБЛИКАТЫ ПО ИМЕНИ И РАЗМЕРУ: \"" name "\" (" size " байт)"
+                print "Первый файл: " first_path[key] " (Дата: " first_mtime[key] ")"
                 printed[key] = 1
             }
+            print "Дубликат: " path " (Дата: " mtime ")"
         } else {
-            dates[key] = 1
-            first_line[key] = $0
+            keys[key] = 1
+            first_path[key] = path
+            first_mtime[key] = mtime
         }
-    }' "$TEMP_NAME_DUPLICATES" > "$TEMP_DATE_DUPLICATES"
+    }' "$TEMP_ALL_FILES" > "$TEMP_NAME_SIZE_DUPLICATES"
 
-    date_dups=$(awk -F'|' '{key = $1 "|" $2 "|" $3; if (!seen[key]++) count++} END {print count}' "$TEMP_DATE_DUPLICATES")
-    echo "Найдено файлов-кандидатов по дате/размеру: $(wc -l < "$TEMP_DATE_DUPLICATES")"
-    echo "Уникальных групп имя+дата+размер: $date_dups"
+    name_size_dups=$(grep -c "ДУБЛИКАТЫ ПО ИМЕНИ И РАЗМЕРУ" "$TEMP_NAME_SIZE_DUPLICATES" || echo "0")
+    echo "Найдено групп дубликатов по имени и размеру: $name_size_dups"
     echo ""
 
-    echo "4. ФИНАЛЬНАЯ ПРОВЕРКА: ДУБЛИКАТЫ ПО ХЭШУ..."
-    echo "------------------------------------------"
+    echo "3. ПРОВЕРКА ДУБЛИКАТОВ ПО ХЭШУ (MD5)..."
+    echo "----------------------------------"
 
-    # Обрабатываем группы файлов для проверки хэша
+    # Собираем все файлы, которые являются дубликатами по имени и размеру
+    echo "Сбор файлов для проверки хэша..."
+    
+    # Извлекаем пути всех файлов-дубликатов
+    grep "Дубликат: " "$TEMP_NAME_SIZE_DUPLICATES" | sed 's/Дубликат: //' | while read -r file; do
+        # Также добавляем первый файл из каждой группы
+        grep "Первый файл: " "$TEMP_NAME_SIZE_DUPLICATES" | sed 's/Первый файл: //' | awk '{print $1}' | while read -r first_file; do
+            filename1=$(basename "$file")
+            size1=$(get_size "$file")
+            filename2=$(basename "$first_file")
+            size2=$(get_size "$first_file")
+            
+            # Проверяем, что это файлы с одинаковым именем и размером
+            if [ "$filename1" = "$filename2" ] && [ "$size1" = "$size2" ]; then
+                echo "$first_file"
+                echo "$file"
+            fi
+        done
+    done | sort -u > "$TEMP_HASH_CANDIDATES"
+
+    total_candidates=$(wc -l < "$TEMP_HASH_CANDIDATES" | tr -d ' ')
+    echo "Файлов для проверки хэша: $total_candidates"
+    echo "Вычисление хэшей..."
+
+    # Вычисляем хэши для кандидатов
+    while read -r file; do
+        if [ -f "$file" ]; then
+            hash=$(get_md5 "$file")
+            if [ "$hash" != "ERROR" ]; then
+                filename=$(basename "$file")
+                size=$(get_size "$file")
+                echo "$hash|$filename|$size|$file"
+            fi
+        fi
+    done < "$TEMP_HASH_CANDIDATES" | sort > "$TEMP_HASH_DUPLICATES"
+
+    # Группируем по хэшу и выводим результаты
+    echo ""
+    echo "=== ТОЧНЫЕ ДУБЛИКАТЫ (ПО ХЭШУ) ==="
+    
     awk -F'|' '
     {
-        name = $1
-        mtime = $2 
+        hash = $1
+        filename = $2
         size = $3
-        path = $5
+        path = $4
         
-        key = name "|" mtime "|" size
-        group[key] = group[key] path "\n"
+        if (hash == prev_hash) {
+            if (!printed[hash]) {
+                print "\nТОЧНЫЕ ДУБЛИКАТЫ (хэш: " hash ")"
+                print "Файл: " filename " (" size " байт)"
+                print "Первый файл: " first_path[hash]
+                printed[hash] = 1
+                count++
+            }
+            print "Дубликат: " path
+        } else {
+            prev_hash = hash
+            first_path[hash] = path
+        }
     }
     END {
-        for (key in group) {
-            print "GROUP:" key
-            printf "%s", group[key]
-            print ""  # разделитель между группами
+        if (count > 0) {
+            print "\nВсего групп точных дубликатов: " count
+        } else {
+            print "Точные дубликаты не найдены."
         }
-    }' "$TEMP_DATE_DUPLICATES" > "${TEMP_HASH_DUPLICATES}.tmp"
+    }' "$TEMP_HASH_DUPLICATES"
 
-    # Обрабатываем группы и вычисляем хэши
-    group_processed=0
-    current_files=""
-    current_key=""
+    hash_dups=$(awk -F'|' '
+    {
+        hash = $1
+        if (hash == prev_hash && !printed[hash]) {
+            count++
+            printed[hash] = 1
+        }
+        prev_hash = hash
+    }
+    END { print count }' "$TEMP_HASH_DUPLICATES")
+
+    echo ""
+    echo "4. ФОРМИРОВАНИЕ ОТЧЕТА..."
+    echo "-----------------------"
+
+    # Объединяем все результаты
+    echo "=== ДУБЛИКАТЫ ПО ИМЕНИ И РАЗМЕРУ ==="
+    cat "$TEMP_NAME_SIZE_DUPLICATES"
+    echo ""
     
-    while IFS= read -r line; do
-        if echo "$line" | grep -q "^GROUP:"; then
-            # Обрабатываем предыдущую группу
-            if [ -n "$current_files" ] && [ -n "$current_key" ]; then
-                process_group "$current_files" "$current_key"
-                group_processed=$((group_processed + 1))
-            fi
-            current_key=$(echo "$line" | cut -d: -f2-)
-            current_files=""
-        elif [ -n "$line" ]; then
-            current_files="${current_files}${line}"$'\n'
-        fi
-    done < "${TEMP_HASH_DUPLICATES}.tmp"
-
-    # Обрабатываем последнюю группу
-    if [ -n "$current_files" ] && [ -n "$current_key" ]; then
-        process_group "$current_files" "$current_key"
-        group_processed=$((group_processed + 1))
-    fi
-
-    echo "Обработано групп: $group_processed"
-    hash_dups=$(grep -c "РЕАЛЬНЫЕ ДУБЛИКАТЫ:" "$TEMP_HASH_DUPLICATES" 2>/dev/null || echo "0")
-    echo "Найдено групп реальных дубликатов: $hash_dups"
+    echo "=== ТОЧНЫЕ ДУБЛИКАТЫ (ПО ХЭШУ) ==="
+    awk -F'|' '
+    {
+        hash = $1
+        filename = $2
+        size = $3
+        path = $4
+        
+        if (hash == prev_hash) {
+            if (!printed[hash]) {
+                print "\nТОЧНЫЕ ДУБЛИКАТЫ (хэш: " hash ")"
+                print "Файл: " filename " (" size " байт)"
+                print "Первый файл: " first_path[hash]
+                printed[hash] = 1
+            }
+            print "Дубликат: " path
+        } else {
+            prev_hash = hash
+            first_path[hash] = path
+        }
+    }' "$TEMP_HASH_DUPLICATES"
     echo ""
 
-    echo "5. ФИНАЛЬНЫЙ ОТЧЕТ..."
-    echo "-------------------"
-
-    if [ -f "$TEMP_HASH_DUPLICATES" ] && [ -s "$TEMP_HASH_DUPLICATES" ]; then
-        cat "$TEMP_HASH_DUPLICATES"
-    else
-        echo "Реальных дубликатов не найдено."
-    fi
-
-    echo ""
     echo "=============================================="
-    echo "СТАТИСТИКА ФИЛЬТРАЦИИ:"
+    echo "СТАТИСТИКА:"
     echo "Всего файлов проверено: $total_files"
-    echo "Файлов с одинаковыми именами: $(wc -l < "$TEMP_NAME_DUPLICATES" 2>/dev/null || echo 0)"
-    echo "Файлов с одинаковыми именами+датами+размерами: $(wc -l < "$TEMP_DATE_DUPLICATES" 2>/dev/null || echo 0)"
-    echo "Реальных дубликатов (прошли все фильтры): $hash_dups групп"
+    echo "Дубликатов по имени и размеру: $name_size_dups групп"
+    echo "Точных дубликатов (по хэшу): ${hash_dups:-0} групп"
+    echo ""
+    echo "Отчет сохранен: $OUTPUT_FILE"
 
-} | tee "$OUTPUT_FILE"
+    # Очистка временных файлов
+    rm -f "$TEMP_ALL_FILES" "$TEMP_NAME_SIZE_DUPLICATES" "$TEMP_HASH_CANDIDATES" "$TEMP_HASH_DUPLICATES"
 
-# Очистка временных файлов
-cleanup() {
-    rm -f "$TEMP_ALL_FILES" "$TEMP_NAME_DUPLICATES" "$TEMP_DATE_DUPLICATES" "$TEMP_HASH_DUPLICATES" "${TEMP_HASH_DUPLICATES}.tmp"
-}
-
-trap cleanup EXIT
+} 2>&1 | tee "$OUTPUT_FILE"
 
 echo ""
 echo "=== ЗАВЕРШЕНО ==="
-echo "Финальный отчет только с реальными дубликатами: $OUTPUT_FILE"
+echo "Полный отчет: $OUTPUT_FILE"
