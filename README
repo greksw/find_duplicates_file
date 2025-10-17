@@ -1,0 +1,4 @@
+# Переходим в корень и запускаем
+cd /mnt/data/Exchange
+chmod +x find_duplicates_exchange.sh
+./find_duplicates_exchange.sh
