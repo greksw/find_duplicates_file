@@ -2,10 +2,10 @@
 # Переходим в корень и запускаем
 cd /mnt/data/Exchange
 chmod +x find_duplicates_exchange.sh
-./script.sh [директория] [файл_отчета] [глубина_поиска]
+./script.sh 
 Пример:
 
-./find_duplicates_exchange.sh /mnt/data/Exchange /tmp/my_report.txt 5
+./find_duplicates_exchange.sh 
 Скрипт создаст подробный отчет с группировкой дубликатов и статистикой.
 
 Мониторинг выполнения:
