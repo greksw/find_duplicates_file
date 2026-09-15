@@ -2,7 +2,6 @@
 set -Eeuo pipefail
 umask 077
 
-PROGRAM_NAME=${0##*/}
 SEARCH_DIR=''
 REPORT_FILE=''
 MAX_DEPTH=''
