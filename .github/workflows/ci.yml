@@ -1,0 +1,69 @@
+name: Shell CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'portfolio/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Bash syntax
+        run: |
+          bash -n duplicate-file-finder.sh
+          bash -n find_duplicates_exchange.sh
+
+      - name: ShellCheck
+        run: |
+          shellcheck duplicate-file-finder.sh find_duplicates_exchange.sh
+
+      - name: Integration scan
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          chmod +x duplicate-file-finder.sh find_duplicates_exchange.sh
+
+          test_root="$RUNNER_TEMP/duplicate-file-finder-test"
+          data="$test_root/data"
+          report="$test_root/report.txt"
+          mkdir -p "$data/alpha" "$data/beta"
+
+          printf 'same-content-one\n' > "$data/alpha/file one.txt"
+          cp "$data/alpha/file one.txt" "$data/beta/file|two.txt"
+
+          newline_name=$'file\nthree.txt'
+          cp "$data/alpha/file one.txt" "$data/beta/$newline_name"
+
+          printf 'second-duplicate-group\n' > "$data/alpha/second-a.bin"
+          cp "$data/alpha/second-a.bin" "$data/beta/second-b.bin"
+
+          printf 'unique\n' > "$data/alpha/unique.txt"
+          ln "$data/alpha/unique.txt" "$data/beta/unique-hardlink.txt"
+
+          ./duplicate-file-finder.sh \
+            --path "$data" \
+            --report "$report"
+
+          test -s "$report"
+          grep -q '^  Duplicate groups: 2$' "$report"
+          grep -q '^  Hard-link aliases skipped: 1$' "$report"
+          grep -q '^  Duplicate files beyond one retained copy per group: 3$' "$report"
+
+          wrapper_report="$test_root/wrapper-report.txt"
+          ./find_duplicates_exchange.sh "$data" "$wrapper_report" 10
+          test -s "$wrapper_report"
+          grep -q '^  Duplicate groups: 2$' "$wrapper_report"
