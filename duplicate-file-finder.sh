@@ -140,10 +140,24 @@ get_file_id() {
 
 get_sha256() {
     local path=$1
+    local line digest
+
     case $HASH_STYLE in
-        freebsd) sha256 -q -- "$path" ;;
-        gnu) sha256sum -- "$path" | awk '{print $1}' ;;
-        shasum) shasum -a 256 -- "$path" | awk '{print $1}' ;;
+        freebsd)
+            sha256 -q -- "$path"
+            ;;
+        gnu)
+            line=$(sha256sum -- "$path") || return 1
+            digest=${line%% *}
+            digest=${digest#\\}
+            printf '%s\n' "$digest"
+            ;;
+        shasum)
+            line=$(shasum -a 256 -- "$path") || return 1
+            digest=${line%% *}
+            digest=${digest#\\}
+            printf '%s\n' "$digest"
+            ;;
     esac
 }
 
